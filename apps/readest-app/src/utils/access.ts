@@ -175,6 +175,14 @@ export const PREMIUM_PLANS: readonly UserPlan[] = ['plus', 'pro'];
  * window-injected config does not exist.
  */
 export const isSelfHosted = (): boolean =>
+  // Self-hosted build: every premium gate is open. `process.env[...]` is NOT
+  // inlined into the Tauri/static-export client bundle (bracket access is not
+  // rewritten by Next's define pass, it survives as a runtime lookup that
+  // resolves to undefined in the webview), so the env-flag route cannot reach
+  // the client. The property name below survives minification, which lets CI
+  // grep the built bundle for it (see .github/workflows/build-selfhosted.yml).
+  (globalThis as { __READEST_SELFHOSTED_PATCH__?: boolean }).__READEST_SELFHOSTED_PATCH__ !==
+    false ||
   getRuntimeConfig()?.selfHosted === true ||
   // `??` would stop at an empty string, so an explicitly blank SELF_HOSTED
   // would mask NEXT_PUBLIC_SELF_HOSTED. `||` falls through on empty too.

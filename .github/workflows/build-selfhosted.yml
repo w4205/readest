@@ -9,10 +9,13 @@
 #     when SENTRY_AUTH_TOKEN is absent, and it is not set here)
 # and one thing added: artifacts go to the workflow run via upload-artifact.
 #
-# The build itself carries NEXT_PUBLIC_SELF_HOSTED=true (in apps/readest-app/
-# .env.tauri), which makes src/utils/access.ts:177 isSelfHosted() return true,
-# which makes isCustomizationAllowed() (access.ts:187) true for every user,
-# signed in or not. See targets/readest/补丁记录.md for the full gate inventory.
+# The build itself carries the fork's paywall patch: apps/readest-app/src/utils/
+# access.ts isSelfHosted() is forced true, which makes isCustomizationAllowed()
+# (access.ts:187) true for every user, signed in or not. The NEXT_PUBLIC_SELF_HOSTED
+# env route does NOT work here — verified on run 39784615883: Next does not
+# rewrite the bracket form `process.env['NEXT_PUBLIC_SELF_HOSTED']`, so it
+# survived into the client bundle as a runtime lookup that yields undefined in
+# the webview. See targets/readest/补丁记录.md for the full gate inventory.
 name: Build self-hosted
 
 on:
@@ -63,12 +66,11 @@ jobs:
         with:
           key: selfhosted-win-x64-cargo
 
-      # Fail fast, before the ~40 minute Rust compile: the whole point of this
-      # build is the paywall flag, so prove it reached the client bundle. Next
-      # inlines process.env['NEXT_PUBLIC_*'] at build time, so after a correct
-      # build the literal name must be GONE from out/_next/static/chunks and the
-      # isSelfHosted() expression must be constant-folded to a truthy literal.
-      - name: build frontend and verify the paywall flag was inlined
+      # Fail fast, before the ~40 minute Rust compile. The whole point of this
+      # build is the paywall patch, so prove it reached the client bundle: the
+      # patched isSelfHosted() reads a global whose property name survives
+      # minification, so the marker must be present in out/_next/static/chunks.
+      - name: build frontend and verify the paywall patch landed
         shell: bash
         env:
           NODE_OPTIONS: '--max-old-space-size=8192'
@@ -78,16 +80,14 @@ jobs:
           pnpm build-tauri
           chunks=out/_next/static/chunks
           echo "== chunks: $(ls "$chunks" | wc -l) files =="
-          if grep -rlq 'NEXT_PUBLIC_SELF_HOSTED' "$chunks"; then
-            echo "::error::NEXT_PUBLIC_SELF_HOSTED survived into the bundle as a runtime lookup — the flag was NOT inlined, the build would still be paywalled"
-            grep -rho '.\{60\}NEXT_PUBLIC_SELF_HOSTED.\{80\}' "$chunks" | head -3
+          if ! grep -rlq '__READEST_SELFHOSTED_PATCH__' "$chunks"; then
+            echo "::error::paywall patch marker missing from the bundle — access.ts was not the source that got compiled"
             exit 1
           fi
-          echo "== flag inlined: no runtime lookup left in the bundle =="
-          echo "== isSelfHosted() call sites (property name survives minification) =="
-          grep -rho 'selfHosted.\{0,90\}' "$chunks" | sort -u | head -8 || true
-          echo "== customization gate evidence =="
-          grep -rho '.\{40\}CustomizationAllowed.\{0,80\}' "$chunks" | sort -u | head -6 || true
+          echo "== patch marker present in: =="
+          grep -rl '__READEST_SELFHOSTED_PATCH__' "$chunks"
+          echo "== patched predicate as compiled (should be `!== false` on a global) =="
+          grep -rho '.\{0,60\}__READEST_SELFHOSTED_PATCH__.\{0,80\}' "$chunks" | sort -u | head -4
 
       - name: build desktop bundle
         shell: bash
