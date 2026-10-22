@@ -1,0 +1,114 @@
+# Self-hosted Windows build — no local toolchain needed.
+#
+# This is a trimmed copy of the Windows x64 leg of upstream
+# .github/workflows/nightly.yml (matrix entry `--target x86_64-pc-windows-msvc
+# --bundles nsis`) with everything that needs readest's own secrets removed:
+#   * TAURI_SIGNING_PRIVATE_KEY / updater .sig step
+#   * rclone -> Cloudflare R2 upload of artifacts + manifest fragment
+#   * Sentry source-map upload (scripts/upload-sourcemaps.mjs already no-ops
+#     when SENTRY_AUTH_TOKEN is absent, and it is not set here)
+# and one thing added: artifacts go to the workflow run via upload-artifact.
+#
+# The build itself carries NEXT_PUBLIC_SELF_HOSTED=true (in apps/readest-app/
+# .env.tauri), which makes src/utils/access.ts:177 isSelfHosted() return true,
+# which makes isCustomizationAllowed() (access.ts:187) true for every user,
+# signed in or not. See targets/readest/补丁记录.md for the full gate inventory.
+name: Build self-hosted
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-selfhosted.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  win-x64:
+    name: windows x64 (nsis)
+    runs-on: windows-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # packages/tauri (the readest tauri fork), packages/foliate-js,
+      # packages/simplecc-wasm and the src-tauri plugins all live here.
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: selfhosted-win-x64-cargo
+
+      # Fail fast, before the ~40 minute Rust compile: the whole point of this
+      # build is the paywall flag, so prove it reached the client bundle. Next
+      # inlines process.env['NEXT_PUBLIC_*'] at build time, so after a correct
+      # build the literal name must be GONE from out/_next/static/chunks and the
+      # isSelfHosted() expression must be constant-folded to a truthy literal.
+      - name: build frontend and verify the paywall flag was inlined
+        shell: bash
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm build-tauri
+          chunks=out/_next/static/chunks
+          echo "== chunks: $(ls "$chunks" | wc -l) files =="
+          if grep -rlq 'NEXT_PUBLIC_SELF_HOSTED' "$chunks"; then
+            echo "::error::NEXT_PUBLIC_SELF_HOSTED survived into the bundle as a runtime lookup — the flag was NOT inlined, the build would still be paywalled"
+            grep -rho '.\{60\}NEXT_PUBLIC_SELF_HOSTED.\{80\}' "$chunks" | head -3
+            exit 1
+          fi
+          echo "== flag inlined: no runtime lookup left in the bundle =="
+          echo "== isSelfHosted() call sites (property name survives minification) =="
+          grep -rho 'selfHosted.\{0,90\}' "$chunks" | sort -u | head -8 || true
+          echo "== customization gate evidence =="
+          grep -rho '.\{40\}CustomizationAllowed.\{0,80\}' "$chunks" | sort -u | head -6 || true
+
+      - name: build desktop bundle
+        shell: bash
+        timeout-minutes: 85
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+          cd ../..
+          echo "== bundles =="
+          ls -l target/x86_64-pc-windows-msvc/release/bundle/nsis/ || true
+          ls -l target/x86_64-pc-windows-msvc/release/readest.exe || true
+
+      - name: upload installer and portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: readest-selfhosted-win-x64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            target/x86_64-pc-windows-msvc/release/readest.exe
