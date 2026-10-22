@@ -89,15 +89,36 @@ jobs:
           echo "== patched predicate as compiled (should be `!== false` on a global) =="
           grep -rho '.\{0,60\}__READEST_SELFHOSTED_PATCH__.\{0,80\}' "$chunks" | sort -u | head -4
 
+      # tauri.conf.json has bundle.createUpdaterArtifacts:true plus a pubkey but
+      # no private key here, so the bundler aborts with "A public key has been
+      # found, but no private key" (run 39785376972, after ~25 min of Rust).
+      # Generate a fork-local minisign keypair and override plugins.updater.pubkey
+      # with it. Side effect worth knowing: the updater still checks readest.com,
+      # but official installers no longer verify against our pubkey, so an
+      # auto-update cannot silently replace this patched build.
+      - name: generate fork-local updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri signer generate -w "$RUNNER_TEMP/readest.key" -p "" --ci --force
+          pub=$(cat "$RUNNER_TEMP/readest.key.pub")
+          printf '{"plugins":{"updater":{"pubkey":"%s"}}}
+' "$pub" > "$RUNNER_TEMP/pubkey.json"
+          echo "== pubkey override =="
+          cat "$RUNNER_TEMP/pubkey.json"
+
       - name: build desktop bundle
         shell: bash
         timeout-minutes: 85
         env:
           NODE_OPTIONS: '--max-old-space-size=8192'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/readest.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         run: |
           set -euo pipefail
           cd apps/readest-app
-          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis             --config "$RUNNER_TEMP/pubkey.json"
           cd ../..
           echo "== bundles =="
           ls -l target/x86_64-pc-windows-msvc/release/bundle/nsis/ || true
