@@ -136,3 +136,155 @@ jobs:
           path: |
             target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
             target/x86_64-pc-windows-msvc/release/readest.exe
+
+  # Android arm64 leg — the counterpart of .github/workflows/release.yml's
+  # android matrix entry (`-t aarch64`, NDK 28.2.13676358, keystore.properties
+  # inside gen/android), with rclone/R2/Sentry/release-upload stripped out and
+  # the artifact going to the workflow run instead.
+  #
+  # Signing: the fork's own keystore from the ANDROID_KEY_* repository secrets
+  # (see targets/readest/keystore/). Stable across runs, but it is NOT the
+  # Readest release key, so:
+  #   * installing over an official APK requires uninstalling it first
+  #     (INSTALL_FAILED_UPDATE_INCOMPATIBLE);
+  #   * readest.com updates cannot replace it.
+  # Both also hold for the Windows build, for the same reason.
+  android-arm64:
+    name: android arm64 (apk)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NDK_VERSION: 28.2.13676358
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd
+        with:
+          packages: 'platform-tools'
+
+      - name: install NDK
+        run: sdkmanager "ndk;${NDK_VERSION}"
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: selfhosted-android-arm64-cargo
+
+      # Same fail-fast as the Windows leg: prove the paywall patch reached the
+      # client bundle before spending ~40 minutes on the Rust build.
+      - name: build frontend and verify the paywall patch landed
+        shell: bash
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm build
+          chunks=out/_next/static/chunks
+          echo "== chunks: $(ls "$chunks" | wc -l) files =="
+          if ! grep -rlq '__READEST_SELFHOSTED_PATCH__' "$chunks"; then
+            echo "::error::paywall patch marker missing from the bundle — access.ts was not the source that got compiled"
+            exit 1
+          fi
+          echo "== patch marker present in: =="
+          grep -rl '__READEST_SELFHOSTED_PATCH__' "$chunks"
+
+      # bundle.createUpdaterArtifacts is true with a pubkey baked in, and the
+      # bundler aborts when no private key is available. Same workaround as the
+      # Windows leg.
+      - name: generate fork-local updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri signer generate -w "$RUNNER_TEMP/readest.key" -p "" --ci --force
+          pub=$(cat "$RUNNER_TEMP/readest.key.pub")
+          printf '{"plugins":{"updater":{"pubkey":"%s"}}}' "$pub" > "$RUNNER_TEMP/pubkey.json"
+
+      - name: tauri android init
+        shell: bash
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+
+      - name: write signing config
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > "$RUNNER_TEMP/keystore.jks"
+          {
+            echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}"
+            echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks"
+          } > apps/readest-app/src-tauri/gen/android/keystore.properties
+
+      - name: build apk
+        shell: bash
+        timeout-minutes: 90
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/readest.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri android build -t aarch64 --config "$RUNNER_TEMP/pubkey.json"
+          version=$(jq -r .version package.json)
+          mkdir -p ../../dist-android
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk              "../../dist-android/Readest_${version}_arm64_selfhosted.apk"
+
+      - name: verify signature and record hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=$(ls dist-android/*.apk)
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          echo "== apksigner: $apksigner =="
+          "$apksigner" verify --print-certs "$apk"
+          ls -l "$apk"
+          sha256sum "$apk"
+
+      - name: upload apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: readest-selfhosted-android-arm64
+          if-no-files-found: error
+          retention-days: 14
+          path: dist-android/*.apk
