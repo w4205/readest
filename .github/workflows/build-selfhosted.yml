@@ -242,6 +242,17 @@ jobs:
           rm -rf src-tauri/gen/android
           pnpm tauri android init
           pnpm tauri icon ../../data/icons/readest-book.png
+          # readest ships a CUSTOMISED gen/android (flavor dimensions
+          # store/pen, missingDimensionStrategy, Sentry manifest placeholder,
+          # 15 tracked files). `tauri android init` regenerates the plain
+          # template, which makes Gradle fail with "Could not resolve project
+          # :tauri-plugin-native-bridge ... selects variant:
+          # 'fossBooxPenRelease' / 'fossGenericPenRelease'" for the universal
+          # variant. Restoring the tracked files puts the customisations back
+          # while leaving the untracked generated ones (tauri.properties,
+          # tauri.settings.gradle, jniLibs symlinks) in place — same step
+          # upstream release.yml runs right after `android init`.
+          git checkout -- .
 
       - name: write signing config
         shell: bash
