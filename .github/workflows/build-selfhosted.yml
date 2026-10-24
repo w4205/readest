@@ -22,22 +22,126 @@ name: Build self-hosted
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'rebuild even when upstream version is unchanged'
+        type: boolean
+        default: false
+  # Daily try: if upstream released a new version, rebase the patch onto it,
+  # push main (without needing a local machine) and build all legs here.
+  schedule:
+    - cron: '30 3 * * *'
   push:
     paths:
       - '.github/workflows/build-selfhosted.yml'
       - 'apps/readest-app/src/utils/access.ts'
 
 permissions:
-  contents: read
+  # the sync job rewrites main when upstream ships a new version
+  contents: write
 
 jobs:
+  # Decides whether anything has to be built.
+  #   push              -> always build the pushed commit (normal path)
+  #   dispatch/schedule -> only build when upstream's apps/readest-app version
+  #                        differs from ours (or force=true). When it does:
+  #                        reset onto upstream/main, re-apply the one-line
+  #                        paywall patch, force-push main, then the legs below
+  #                        build that exact commit.
+  sync:
+    name: sync upstream (version gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      rebuild: ${{ steps.decide.outputs.rebuild }}
+      sha: ${{ steps.decide.outputs.sha }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 50
+
+      - id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "push event - building $(git rev-parse --short HEAD)"
+            {
+              echo "rebuild=true"
+              echo "sha=$(git rev-parse HEAD)"
+              echo "version=$(jq -r .version apps/readest-app/package.json)"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name 'readest-selfhosted-bot'
+          git config user.email 'selfhosted-bot@users.noreply.github.com'
+
+          # keep this file across the reset below
+          cp .github/workflows/build-selfhosted.yml "$RUNNER_TEMP/wf.yml"
+
+          git remote add upstream https://github.com/readest/readest.git
+          git fetch --depth 20 upstream main
+          UP=$(git rev-parse upstream/main)
+          OUR_VERSION=$(jq -r .version apps/readest-app/package.json)
+          UP_VERSION=$(git show "$UP:apps/readest-app/package.json" | jq -r .version)
+          echo "ours=$OUR_VERSION upstream=$UP_VERSION upstream_main=$UP force=${{ inputs.force }}"
+
+          if [ "$UP_VERSION" = "$OUR_VERSION" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "::notice::upstream is still $UP_VERSION - nothing to build (pass force=true to rebuild anyway)"
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "== resetting onto upstream $UP_VERSION ($UP) =="
+          git checkout -B main "$UP"
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/wf.yml" .github/workflows/build-selfhosted.yml
+
+          # The whole patch: force isSelfHosted() true. Emits the marker the
+          # build legs grep for. Keep in sync with 补丁记录.md §4.
+          python3 - <<'PY'
+          import sys
+          path = 'apps/readest-app/src/utils/access.ts'
+          src = open(path, encoding='utf-8').read()
+          anchor = 'export const isSelfHosted = (): boolean =>'
+          injected = ('  (globalThis as { __READEST_SELFHOSTED_PATCH__?: boolean })'
+                      '.__READEST_SELFHOSTED_PATCH__ !== false ||')
+          if '__READEST_SELFHOSTED_PATCH__' in src:
+              print('already patched - leaving as is')
+          elif anchor in src:
+              head, rest = src.split(anchor, 1)
+              open(path, 'w', encoding='utf-8').write(head + anchor + '\n' + injected + rest)
+              print('patch applied after:', anchor)
+          else:
+              sys.exit('::error::isSelfHosted() anchor not found in access.ts - '
+                       'upstream restructured the paywall. Re-read 补丁记录.md §1 and pick a new anchor.')
+          PY
+
+          git add -A
+          git commit -m "selfhosted: upstream $UP_VERSION ($UP) + paywall patch"
+          git push --force origin HEAD:main
+
+          {
+            echo "rebuild=true"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "version=$UP_VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::rebased onto upstream $UP_VERSION, building $(git rev-parse --short HEAD)"
+
   win-x64:
     name: windows x64 (nsis)
+    needs: sync
+    if: needs.sync.outputs.rebuild == 'true'
     runs-on: windows-latest
     timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
 
       # packages/tauri (the readest tauri fork), packages/foliate-js,
@@ -157,6 +261,8 @@ jobs:
   # it was built for.
   android:
     name: android ${{ matrix.leg }} (apk)
+    needs: sync
+    if: needs.sync.outputs.rebuild == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -174,6 +280,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
 
       - name: initialize git submodules
