@@ -149,10 +149,26 @@ jobs:
   #     (INSTALL_FAILED_UPDATE_INCOMPATIBLE);
   #   * readest.com updates cannot replace it.
   # Both also hold for the Windows build, for the same reason.
-  android-arm64:
-    name: android arm64 (apk)
+  #
+  # Legs mirror upstream release.yml's android matrix: `arm64` = -t aarch64,
+  # `legacy` = -t armv7 -t i686 -t x86_64 (old 32-bit phones + x86 emulators).
+  # Each leg still produces ONE universal-flavour APK; "universal" there is a
+  # Gradle flavour name, not an ABI set, so a leg's APK only carries the ABIs
+  # it was built for.
+  android:
+    name: android ${{ matrix.leg }} (apk)
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: arm64
+            rust_targets: aarch64-linux-android
+            build_targets: '-t aarch64'
+          - leg: legacy
+            rust_targets: armv7-linux-androideabi i686-linux-android x86_64-linux-android
+            build_targets: '-t armv7 -t i686 -t x86_64'
     env:
       NDK_VERSION: 28.2.13676358
     steps:
@@ -195,11 +211,11 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: ${{ matrix.rust_targets }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: selfhosted-android-arm64-cargo
+          key: selfhosted-android-${{ matrix.leg }}-cargo
 
       # Same fail-fast as the Windows leg: prove the paywall patch reached the
       # client bundle before spending ~40 minutes on the Rust build.
@@ -276,10 +292,10 @@ jobs:
         run: |
           set -euo pipefail
           cd apps/readest-app
-          pnpm tauri android build -t aarch64 --config "$RUNNER_TEMP/pubkey.json"
+          pnpm tauri android build ${{ matrix.build_targets }} --config "$RUNNER_TEMP/pubkey.json"
           version=$(jq -r .version package.json)
           mkdir -p ../../dist-android
-          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk              "../../dist-android/Readest_${version}_arm64_selfhosted.apk"
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk              "../../dist-android/Readest_${version}_${{ matrix.leg }}_selfhosted.apk"
 
       - name: verify signature and record hashes
         shell: bash
@@ -295,7 +311,7 @@ jobs:
       - name: upload apk
         uses: actions/upload-artifact@v4
         with:
-          name: readest-selfhosted-android-arm64
+          name: readest-selfhosted-android-${{ matrix.leg }}
           if-no-files-found: error
           retention-days: 14
           path: dist-android/*.apk
