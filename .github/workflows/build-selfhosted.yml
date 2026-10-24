@@ -422,3 +422,68 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           path: dist-android/*.apk
+
+  # Publishes the built files as a GitHub Release on the fork, so they survive
+  # the 14-day artifact expiry and can be downloaded later without hunting
+  # through old runs. Tag format: selfhosted-v<version>. Re-running for the same
+  # version replaces the assets (--clobber) instead of creating a new release.
+  #
+  # NOTE: the fork is a public repo, so its Releases are publicly downloadable.
+  release:
+    name: publish release
+    needs: [sync, win-x64, android]
+    if: needs.sync.outputs.rebuild == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          COMMIT: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="selfhosted-v${VERSION}"
+          mkdir -p rel
+          find dist -type f \( -name '*.apk' -o -name '*.exe' \) -exec cp -v {} rel/ \;
+          [ -n "$(ls -A rel)" ] || { echo '::error::no build outputs to release'; exit 1; }
+          ( cd rel && sha256sum ./* > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+          notes=$(mktemp)
+          {
+            echo "Self-hosted unlock build of Readest ${VERSION} (paywall patch: \`isSelfHosted()\` forced true)."
+            echo
+            echo "- upstream commit: \`${COMMIT}\`"
+            echo "- built by workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- patch and evidence: \`targets/readest/补丁记录.md\` in the workspace repo"
+            echo
+            echo '| file | what |'
+            echo '|---|---|'
+            echo "| \`Readest_${VERSION}_x64-setup.exe\` | Windows x64 NSIS installer (also portable \`readest.exe\` asset) |"
+            echo "| \`Readest_${VERSION}_arm64_selfhosted.apk\` | Android arm64 (modern phones) |"
+            echo "| \`Readest_${VERSION}_legacy_selfhosted.apk\` | Android armeabi-v7a + x86 + x86_64 (old phones / emulators) |"
+            echo
+            echo "Signing: self-built Android keystore (NOT the official Readest key) — uninstall an official"
+            echo "APK first; this build cannot be updated by the Play Store or by readest.com. Upgrades keep"
+            echo "app data because the keystore is stable across these builds."
+            echo
+            echo 'Verify downloads with `SHA256SUMS.txt`.'
+          } > "$notes"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag exists — replacing assets"
+            gh release upload "$tag" rel/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" rel/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$COMMIT" \
+              --title "Readest ${VERSION} · self-hosted unlock" \
+              --notes-file "$notes"
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url,assets \
+            --jq '.url, (.assets[] | "  \(.name) \(.size) bytes")'
